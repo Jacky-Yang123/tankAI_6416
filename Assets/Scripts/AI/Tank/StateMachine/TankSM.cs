@@ -573,8 +573,8 @@ namespace CE6127.Tanks.AI
         private BTStatus FireAtTarget()
         {
             LaunchProjectile(m_SelectedLaunchForce);
-            // 作业允许范围的最短间隔是0.7秒，固定使用下限，不随机拖到2.5秒。
-            m_NextFireTime = Time.time + FireInterval.x;
+            // 每次射击后，在配置的最短与最长间隔之间随机决定下一次可开火时间。
+            m_NextFireTime = Time.time + Random.Range(FireInterval.x, FireInterval.y);
             return BTStatus.Success;
         }
 
