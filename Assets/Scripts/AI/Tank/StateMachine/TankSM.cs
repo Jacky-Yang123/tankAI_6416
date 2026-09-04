@@ -101,6 +101,13 @@ namespace CE6127.Tanks.AI
         private float m_NextFireTime;
         private float m_NextPathUpdate;
         private float m_StuckSince;
+        private float m_RecoveryUntil;
+        private Vector3 m_RecoveryDestination;
+        private float m_NextLineOfSightSearch;
+        private Vector3 m_LineOfSightDestination;
+        private bool m_HasLineOfSightDestination;
+        private float m_TrafficYieldUntil;
+        private Vector3 m_TrafficYieldDestination;
         private float m_DodgeUntil;
         private Vector3 m_DodgeDestination;
         private int m_LastThreatShellId;
@@ -109,6 +116,8 @@ namespace CE6127.Tanks.AI
         private const float c_MaxAttackDistance = 30f;
         private const float c_AimTolerance = 4f;
         private const float c_PathUpdateInterval = 0.2f;
+        private const float c_FirePreparationLeadTime = 0.6f;
+        private const float c_LineOfSightSearchInterval = 0.35f;
 
         /// <summary>
         /// Method <c>MoveTurnSound</c> returns the current tank's velocity.
@@ -215,6 +224,8 @@ namespace CE6127.Tanks.AI
             {
                 // 先由统一指挥官更新共享感知和三个不同槽位，再执行本车行为树。
                 m_Order = SquadBlackboard.GetOrder(this);
+                // 数值越小越有通行权；固定按职责区分，避免三辆车同为50时互相僵持。
+                NavMeshAgent.avoidancePriority = 25 + (int)m_Order.Role * 25;
                 Target = SquadBlackboard.Player;
                 m_BehaviourTree?.Tick();
             }
@@ -235,8 +246,11 @@ namespace CE6127.Tanks.AI
             BTNode movementBranch = new BTSelector(
                 new BTAction(AvoidIncomingShell),
                 new BTAction(AvoidPlayerCharge),
-                new BTAction(SpreadFromAllies),
+                new BTAction(PrioritizeFiring),
                 new BTAction(RecoverIfStuck),
+                new BTAction(AvoidBlockingAllyRoute),
+                new BTAction(SeekLineOfSightPosition),
+                new BTAction(SpreadFromAllies),
                 new BTAction(FollowAssignedSlot));
 
             BTNode combatBranch = new BTSequence(
@@ -410,6 +424,13 @@ namespace CE6127.Tanks.AI
         /// <summary>有路径却超过1秒几乎没移动时，先向侧面取一个可行点脱离障碍。</summary>
         private BTStatus RecoverIfStuck()
         {
+            // 脱困开始后短暂锁定目标，避免下一帧又被分散或槽位移动覆盖。
+            if (Time.time < m_RecoveryUntil)
+            {
+                SetDestinationOnNavMesh(m_RecoveryDestination, 8f);
+                return BTStatus.Running;
+            }
+
             if (!NavMeshAgent.isOnNavMesh || !NavMeshAgent.hasPath)
             {
                 m_StuckSince = 0f;
@@ -429,16 +450,309 @@ namespace CE6127.Tanks.AI
             if (Time.time - m_StuckSince < 1f)
                 return BTStatus.Failure;
 
-            Vector3 side = (GetInstanceID() & 1) == 0 ? transform.right : -transform.right;
-            SetDestinationOnNavMesh(transform.position + side * 8f - transform.forward * 3f, 8f);
-            m_StuckSince = Time.time;
+            if (!TryChooseRecoveryDestination(out m_RecoveryDestination))
+                m_RecoveryDestination = transform.position - transform.forward * 6f;
+            m_RecoveryUntil = Time.time + 1f;
+            m_StuckSince = 0f;
+            SetDestinationOnNavMesh(m_RecoveryDestination, 8f);
             return BTStatus.Running;
+        }
+
+        /// <summary>从周围可直接走出的方向选择脱困点，避免把目标采样到墙的另一侧。</summary>
+        private bool TryChooseRecoveryDestination(out Vector3 destination)
+        {
+            destination = transform.position;
+            float bestDistance = 0f;
+            float angleOffset = Mathf.Abs(GetInstanceID() % 12) * 30f;
+
+            for (int i = 0; i < 12; ++i)
+            {
+                Vector3 direction = Quaternion.AngleAxis(angleOffset + i * 30f, Vector3.up) * Vector3.forward;
+                Vector3 desired = transform.position + direction * 7f;
+                if (!NavMesh.SamplePosition(desired, out NavMeshHit sample, 2f, NavMesh.AllAreas))
+                    continue;
+                if (NavMesh.Raycast(transform.position, sample.position, out _, NavMesh.AllAreas))
+                    continue;
+                if (!TryGetCompletePathLength(transform.position, sample.position, out _))
+                    continue;
+
+                float distance = Vector3.Distance(transform.position, sample.position);
+                if (distance <= bestDistance)
+                    continue;
+                bestDistance = distance;
+                destination = sample.position;
+            }
+            return bestDistance >= 3f;
+        }
+
+        /// <summary>
+        /// 处理友军交通冲突：同向时后车保持车距；狭窄处迎面相遇时，通行权较低的
+        /// 坦克进入短暂让行点，避免双方持续互顶并堵住整条路线。
+        /// </summary>
+        private BTStatus AvoidBlockingAllyRoute()
+        {
+            if (!NavMeshAgent.isOnNavMesh || !NavMeshAgent.hasPath)
+                return BTStatus.Failure;
+
+            if (Time.time < m_TrafficYieldUntil)
+            {
+                SetDestinationOnNavMesh(m_TrafficYieldDestination, 1.5f);
+                return BTStatus.Running;
+            }
+
+            Vector3 ownDirection = NavMeshAgent.desiredVelocity;
+            ownDirection.y = 0f;
+            if (ownDirection.sqrMagnitude < 0.25f)
+                ownDirection = NavMeshAgent.steeringTarget - transform.position;
+            ownDirection.y = 0f;
+            if (ownDirection.sqrMagnitude < 0.01f)
+                return BTStatus.Failure;
+            ownDirection.Normalize();
+
+            foreach (TankManager allyManager in GameManager.AIPlatoon.Tanks)
+            {
+                if (allyManager.Instance == null || allyManager.Instance == gameObject ||
+                    !allyManager.Instance.activeInHierarchy)
+                    continue;
+                NavMeshAgent allyAgent = allyManager.Instance.GetComponent<NavMeshAgent>();
+                if (allyAgent == null || !allyAgent.isOnNavMesh)
+                    continue;
+
+                Vector3 toAlly = allyManager.Instance.transform.position - transform.position;
+                toAlly.y = 0f;
+                float distance = toAlly.magnitude;
+                if (distance < 0.01f || distance > 7f ||
+                    Vector3.Dot(ownDirection, toAlly.normalized) < 0.35f)
+                    continue;
+
+                Vector3 allyDirection = allyAgent.desiredVelocity;
+                allyDirection.y = 0f;
+                if (allyDirection.sqrMagnitude < 0.25f)
+                    allyDirection = allyAgent.steeringTarget - allyManager.Instance.transform.position;
+                allyDirection.y = 0f;
+                if (allyDirection.sqrMagnitude < 0.01f)
+                    continue;
+                allyDirection.Normalize();
+
+                float routeAlignment = Vector3.Dot(ownDirection, allyDirection);
+                if (routeAlignment > 0.55f && distance < 4.5f)
+                {
+                    // 同向行驶：后车让前车先走，不再从后面持续推挤。
+                    NavMeshAgent.isStopped = true;
+                    return BTStatus.Running;
+                }
+
+                if (routeAlignment >= -0.2f ||
+                    NavMeshAgent.avoidancePriority <= allyAgent.avoidancePriority)
+                    continue;
+
+                if (TryChooseTrafficYieldPoint(ownDirection,
+                        allyManager.Instance.transform.position, out m_TrafficYieldDestination))
+                {
+                    m_TrafficYieldUntil = Time.time + 0.75f;
+                    SetDestinationOnNavMesh(m_TrafficYieldDestination, 1.5f);
+                }
+                else
+                {
+                    // 没有侧向空间时由低通行权车辆停车，让另一辆先通过。
+                    m_TrafficYieldDestination = transform.position;
+                    m_TrafficYieldUntil = Time.time + 0.35f;
+                    NavMeshAgent.isStopped = true;
+                }
+                return BTStatus.Running;
+            }
+            return BTStatus.Failure;
+        }
+
+        private bool TryChooseTrafficYieldPoint(
+            Vector3 routeDirection, Vector3 blockingAlly, out Vector3 destination)
+        {
+            destination = transform.position;
+            Vector3 side = Vector3.Cross(Vector3.up, routeDirection).normalized;
+            float bestScore = float.MinValue;
+
+            for (int sign = -1; sign <= 1; sign += 2)
+            {
+                Vector3 desired = transform.position + side * sign * 4.5f - routeDirection * 2f;
+                if (!NavMesh.SamplePosition(desired, out NavMeshHit sample, 1.5f, NavMesh.AllAreas))
+                    continue;
+                if (NavMesh.Raycast(transform.position, sample.position, out _, NavMesh.AllAreas) ||
+                    !TryGetCompletePathLength(transform.position, sample.position, out _))
+                    continue;
+
+                float score = Vector3.Distance(sample.position, blockingAlly);
+                foreach (TankManager ally in GameManager.AIPlatoon.Tanks)
+                {
+                    if (ally.Instance == null || ally.Instance == gameObject ||
+                        !ally.Instance.activeInHierarchy)
+                        continue;
+                    score += Vector3.Distance(sample.position, ally.Instance.transform.position) * 0.25f;
+                }
+                if (score <= bestScore)
+                    continue;
+                bestScore = score;
+                destination = sample.position;
+            }
+            return bestScore > float.MinValue;
+        }
+
+        /// <summary>被建筑挡住时主动换到可到达、能直接看见玩家的射击位置。</summary>
+        private BTStatus SeekLineOfSightPosition()
+        {
+            if (Target == null || !NavMeshAgent.isOnNavMesh)
+            {
+                m_HasLineOfSightDestination = false;
+                return BTStatus.Failure;
+            }
+
+            bool hasSight = HasDirectLineOfSightFrom(transform.position);
+            // 开阔区域有视线时继续执行阵型；狭窄区域则改为独立选择射击位。
+            if (hasSight && !SquadBlackboard.PlayerInNarrowArea)
+            {
+                m_HasLineOfSightDestination = false;
+                return BTStatus.Failure;
+            }
+
+            if (m_HasLineOfSightDestination &&
+                Vector3.Distance(transform.position, m_LineOfSightDestination) < 2f)
+            {
+                m_HasLineOfSightDestination = false;
+                m_NextLineOfSightSearch = 0f;
+            }
+
+            if (!m_HasLineOfSightDestination && Time.time >= m_NextLineOfSightSearch)
+            {
+                m_NextLineOfSightSearch = Time.time + c_LineOfSightSearchInterval;
+                m_HasLineOfSightDestination = TryFindLineOfSightDestination(
+                    out m_LineOfSightDestination);
+            }
+
+            if (!m_HasLineOfSightDestination)
+                return BTStatus.Failure;
+
+            SetDestinationOnNavMesh(m_LineOfSightDestination, 1.5f);
+            return BTStatus.Running;
+        }
+
+        private bool TryFindLineOfSightDestination(out Vector3 destination)
+        {
+            destination = transform.position;
+            float bestScore = float.MaxValue;
+            Vector3 fallback = transform.position;
+            float bestFallbackScore = float.MaxValue;
+            float radius = SquadBlackboard.PlayerInNarrowArea
+                ? Mathf.Clamp(SquadBlackboard.CombatRadius - 2f, 11.5f, 15f)
+                : Mathf.Clamp(SquadBlackboard.CombatRadius, 12f, 20f);
+            float angleOffset = Mathf.Abs(GetInstanceID() % 16) * 22.5f;
+
+            for (int i = 0; i < 16; ++i)
+            {
+                Vector3 radial = Quaternion.AngleAxis(angleOffset + i * 22.5f, Vector3.up) * Vector3.forward;
+                Vector3 desired = SquadBlackboard.PlayerPosition + radial * radius;
+                if (!NavMesh.SamplePosition(desired, out NavMeshHit sample, 4f, NavMesh.AllAreas))
+                    continue;
+                if (!TryGetCompletePathLength(transform.position, sample.position, out float pathLength))
+                    continue;
+
+                float score = pathLength;
+                foreach (TankManager ally in GameManager.AIPlatoon.Tanks)
+                {
+                    if (ally.Instance == null || ally.Instance == gameObject ||
+                        !ally.Instance.activeInHierarchy)
+                        continue;
+                    float separation = Vector3.Distance(sample.position, ally.Instance.transform.position);
+                    if (separation < SquadBlackboard.MinimumAllyDistance)
+                        score += (SquadBlackboard.MinimumAllyDistance - separation) * 4f;
+                }
+
+                // 狭窄区域找不到立即可射击的位置时，至少选择完整可达的接近点，
+                // 下一次搜索再从新位置寻找视线，不能退回旋转阵型。
+                if (score < bestFallbackScore)
+                {
+                    bestFallbackScore = score;
+                    fallback = sample.position;
+                }
+                if (!HasDirectLineOfSightFrom(sample.position))
+                    continue;
+
+                if (score >= bestScore)
+                    continue;
+                bestScore = score;
+                destination = sample.position;
+            }
+            if (bestScore < float.MaxValue)
+                return true;
+            if (SquadBlackboard.PlayerInNarrowArea && bestFallbackScore < float.MaxValue)
+            {
+                destination = fallback;
+                return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// 开火机会高于阵型移动。随机冷却即将结束且当前有视线、距离合适时，
+        /// 暂停 NavMesh 移动，让并行战斗分支稳定瞄准并立即发射。
+        /// </summary>
+        private BTStatus PrioritizeFiring()
+        {
+            if (Target == null || !Target.gameObject.activeInHierarchy ||
+                !NavMeshAgent.isOnNavMesh ||
+                m_NextFireTime - Time.time > c_FirePreparationLeadTime ||
+                !HasDirectLineOfSightFrom(transform.position))
+                return BTStatus.Failure;
+
+            Vector3 toPlayer = SquadBlackboard.PlayerPosition - transform.position;
+            toPlayer.y = 0f;
+            if (toPlayer.magnitude < c_MinAttackDistance ||
+                toPlayer.magnitude > c_MaxAttackDistance ||
+                !IsRoleAllowedToFire())
+                return BTStatus.Failure;
+
+            NavMeshAgent.isStopped = true;
+            return BTStatus.Running;
+        }
+
+        private bool HasDirectLineOfSightFrom(Vector3 groundPosition)
+        {
+            float muzzleHeight = Mathf.Max(0.5f, FireTransform.position.y - transform.position.y);
+            Vector3 origin = groundPosition + Vector3.up * muzzleHeight;
+            Vector3 targetPoint = SquadBlackboard.PlayerPosition;
+            targetPoint.y = GetTargetImpactHeight();
+            Vector3 ray = targetPoint - origin;
+            if (ray.sqrMagnitude < 0.01f)
+                return true;
+
+            RaycastHit[] hits = Physics.RaycastAll(
+                origin, ray.normalized, ray.magnitude, ~0, QueryTriggerInteraction.Ignore);
+            Array.Sort(hits, (a, b) => a.distance.CompareTo(b.distance));
+            foreach (RaycastHit hit in hits)
+            {
+                if (hit.transform.root == transform.root)
+                    continue;
+                return Target != null && hit.transform.root == Target.root;
+            }
+            return true;
+        }
+
+        private static bool TryGetCompletePathLength(Vector3 start, Vector3 end, out float length)
+        {
+            length = 0f;
+            NavMeshPath path = new();
+            if (!NavMesh.CalculatePath(start, end, NavMesh.AllAreas, path) ||
+                path.status != NavMeshPathStatus.PathComplete)
+                return false;
+            for (int i = 1; i < path.corners.Length; ++i)
+                length += Vector3.Distance(path.corners[i - 1], path.corners[i]);
+            return true;
         }
 
         /// <summary>执行指挥官分配的独立槽位；NavMesh 自动选择当前地图上的最短可行路径。</summary>
         private BTStatus FollowAssignedSlot()
         {
-            if (!m_Order.HasSlot || !NavMeshAgent.isOnNavMesh)
+            // 玩家处于通道或夹角时，移动完全交给独立射击位搜索，不执行阵型。
+            if (SquadBlackboard.PlayerInNarrowArea ||
+                !m_Order.HasSlot || !NavMeshAgent.isOnNavMesh)
                 return BTStatus.Failure;
 
             if (Time.time >= m_NextPathUpdate)
@@ -487,11 +801,18 @@ namespace CE6127.Tanks.AI
             m_HasBallisticSolution = CalculateBallisticSolution(
                 m_PredictedAimPoint, out m_SelectedLaunchForce, out flightTime);
 
-            Vector3 aimDirection = m_PredictedAimPoint - transform.position;
-            aimDirection.y = 0f;
-            if (aimDirection.sqrMagnitude > 0.01f)
+            Vector3 facingPoint = m_PredictedAimPoint;
+            // 玩家被墙挡住时先朝 NavMesh 的下一个拐角转，避免车体瞄着墙横向硬挤。
+            if (NavMeshAgent.isOnNavMesh && NavMeshAgent.hasPath &&
+                NavMesh.Raycast(transform.position, SquadBlackboard.PlayerPosition,
+                    out _, NavMesh.AllAreas))
+                facingPoint = NavMeshAgent.steeringTarget;
+
+            Vector3 facingDirection = facingPoint - transform.position;
+            facingDirection.y = 0f;
+            if (facingDirection.sqrMagnitude > 0.01f)
             {
-                Quaternion desired = Quaternion.LookRotation(aimDirection.normalized, Vector3.up);
+                Quaternion desired = Quaternion.LookRotation(facingDirection.normalized, Vector3.up);
                 transform.rotation = Quaternion.RotateTowards(
                     transform.rotation, desired, GameManager.AngularSpeed * Time.deltaTime);
             }
