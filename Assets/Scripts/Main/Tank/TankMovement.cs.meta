@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: 9be361aee37f03f499c4b57e7e50aaa6
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences:
+  - m_MovementAudio: {instanceID: 0}
+  - m_EngineIdling: {fileID: 8300000, guid: d7ca9fb5aa30155449192b23d7fb3336, type: 3}
+  - m_EngineDriving: {instanceID: 0}
+  executionOrder: 0
+  icon: {instanceID: 0}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 

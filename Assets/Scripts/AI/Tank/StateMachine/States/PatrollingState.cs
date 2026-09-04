@@ -19,28 +19,23 @@ namespace CE6127.Tanks.AI
         /// </summary>
         public PatrollingState(TankSM tankStateMachine) : base("Patrolling", tankStateMachine) => m_TankSM = (TankSM)m_StateMachine;
 
-        /// <summary>
         /// Method <c>Enter</c> on enter.
-        /// </summary>
         public override void Enter()
         {
             base.Enter();
-
             m_TankSM.SetStopDistanceToZero();
-
             m_TankSM.StartCoroutine(Patrolling());
         }
 
-        /// <summary>
         /// Method <c>Update</c> update logic.
-        /// </summary>
         public override void Update()
         {
             base.Update();
             if (m_TankSM.Target != null)
             {
                 var dist = Vector3.Distance(m_TankSM.transform.position, m_TankSM.Target.position);
-                if (dist <= m_TankSM.StopDistance) // ... Obviously this doesn't make much sense, but it's just for demonstration purposes.
+                if (dist <= m_TankSM.StopDistance) // ... Obviously this doesn't make much sense,
+                                                   // but it's just for demonstration purposes.
                     m_StateMachine.ChangeState(m_TankSM.m_States.Idle);
             }
 
@@ -51,9 +46,7 @@ namespace CE6127.Tanks.AI
             }
         }
 
-        /// <summary>
         /// Method <c>Exit</c> on exiting PatrollingState.
-        /// </summary>
         public override void Exit()
         {
             base.Exit();
@@ -61,9 +54,7 @@ namespace CE6127.Tanks.AI
             m_TankSM.StopCoroutine(Patrolling());
         }
 
-        /// <summary>
         /// Coroutine <c>Patrolling</c> patrolling coroutine.
-        /// </summary>
         IEnumerator Patrolling()
         {
             while (true)
