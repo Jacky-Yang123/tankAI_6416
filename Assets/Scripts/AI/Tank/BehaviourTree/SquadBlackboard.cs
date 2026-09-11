@@ -102,7 +102,7 @@ namespace CE6127.Tanks.AI
                 };
         }
 
-        /// <summary>每帧只更新一次感知；较昂贵的路径与职责分配每0.2秒更新一次。</summary>
+        /// <summary>每帧只更新一次感知；较昂贵的路径与职责分配每0.3秒更新一次。</summary>
         public static void Update(GameManager gameManager)
         {
             if (s_LastFrame == Time.frameCount)
@@ -131,7 +131,7 @@ namespace CE6127.Tanks.AI
 
             if (Time.time >= s_NextTacticalUpdate)
             {
-                s_NextTacticalUpdate = Time.time + 0.2f;
+                s_NextTacticalUpdate = Time.time + 0.3f;
                 AssignTacticalOrders(tanks, gameManager.Speed);
             }
 
@@ -188,7 +188,8 @@ namespace CE6127.Tanks.AI
                     Vector3.Distance(centre.position, edge.position) < probeDistance * 0.9f)
                     blockedDirections++;
             }
-            PlayerInNarrowArea = blockedDirections >= 4;
+            // 用滞后避免站在障碍物边缘时在“通道/开阔”两种判断间逐帧跳变。
+            PlayerInNarrowArea = blockedDirections >= (PlayerInNarrowArea ? 3 : 4);
         }
 
         private static void ReadPlayer(GameManager gameManager)
@@ -404,7 +405,8 @@ namespace CE6127.Tanks.AI
                     cost += targets[tankIndex, roleIndex].Cost;
                     if (s_Orders.TryGetValue(tanks[tankIndex].GetInstanceID(), out SquadOrder oldOrder) &&
                         oldOrder.HasSlot && oldOrder.Role != (SquadRole)roleIndex)
-                        cost += 5f;
+                        // 只有路径明显更好时才换职责，避免每0.3秒互换槽位造成反复掉头。
+                        cost += 12f;
                 }
                 if (cost < bestCost)
                 {
@@ -460,8 +462,9 @@ namespace CE6127.Tanks.AI
             {
                 float baseAngle = role == SquadRole.Pressure ? 180f :
                     role == SquadRole.LeftInterceptor ? 60f : -60f;
-                // 整个三角阵型共同旋转，因此三车持续大幅换位但始终保持120度关系。
-                float orbitSpeed = RemainingRoundTime <= 20f ? 24f : 18f;
+                // 常规阶段固定槽位，避免每次重算都要求坦克转向追逐旋转阵型；
+                // 最后20秒才缓慢换位，制造新的射击角度。
+                float orbitSpeed = RemainingRoundTime <= 20f ? 6f : 0f;
                 float angle = baseAngle + Time.time * orbitSpeed;
                 Vector3 desired = PlayerPosition +
                                   Quaternion.AngleAxis(angle, Vector3.up) * PlayerForward * CombatRadius;

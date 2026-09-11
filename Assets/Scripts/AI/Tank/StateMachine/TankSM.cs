@@ -250,6 +250,7 @@ namespace CE6127.Tanks.AI
                 new BTAction(RecoverIfStuck),
                 new BTAction(AvoidBlockingAllyRoute),
                 new BTAction(SeekLineOfSightPosition),
+                new BTAction(ChasePlayerWhenNeeded),
                 new BTAction(SpreadFromAllies),
                 new BTAction(FollowAssignedSlot));
 
@@ -431,7 +432,11 @@ namespace CE6127.Tanks.AI
                 return BTStatus.Running;
             }
 
-            if (!NavMeshAgent.isOnNavMesh || !NavMeshAgent.hasPath)
+            // 已停下瞄准、已经接近目标、或路径仍在计算都不是“卡住”。
+            if (!NavMeshAgent.isOnNavMesh || !NavMeshAgent.hasPath ||
+                NavMeshAgent.isStopped || NavMeshAgent.pathPending ||
+                NavMeshAgent.remainingDistance <= 2f ||
+                NavMeshAgent.desiredVelocity.sqrMagnitude < 0.25f)
             {
                 m_StuckSince = 0f;
                 m_LastProgressPosition = transform.position;
@@ -606,8 +611,9 @@ namespace CE6127.Tanks.AI
             }
 
             bool hasSight = HasDirectLineOfSightFrom(transform.position);
-            // 开阔区域有视线时继续执行阵型；狭窄区域则改为独立选择射击位。
-            if (hasSight && !SquadBlackboard.PlayerInNarrowArea)
+            // 已有视线时不再为了“换位置”打断瞄准；狭窄地形只是不维持阵型，
+            // 并不代表已经取得射击角度后还要继续绕圈。
+            if (hasSight)
             {
                 m_HasLineOfSightDestination = false;
                 return BTStatus.Failure;
@@ -691,6 +697,41 @@ namespace CE6127.Tanks.AI
         }
 
         /// <summary>
+        /// 无视线、超出射程，或玩家钻进狭窄地形时，按本车当前相对方位靠近玩家。
+        /// 这不是三车共用一个目标点，因此不会在通道里排成一列或直接放弃追击。
+        /// </summary>
+        private BTStatus ChasePlayerWhenNeeded()
+        {
+            if (Target == null || !NavMeshAgent.isOnNavMesh)
+                return BTStatus.Failure;
+
+            Vector3 fromPlayer = transform.position - SquadBlackboard.PlayerPosition;
+            fromPlayer.y = 0f;
+            float distance = fromPlayer.magnitude;
+            bool hasSight = HasDirectLineOfSightFrom(transform.position);
+            bool needsChase = SquadBlackboard.PlayerInNarrowArea ||
+                              !hasSight || distance > c_MaxAttackDistance;
+            if (!needsChase)
+                return BTStatus.Failure;
+
+            float approachDistance = SquadBlackboard.PlayerInNarrowArea ? 10f :
+                Mathf.Clamp(SquadBlackboard.CombatRadius - 2f, 10f, 14f);
+            if (hasSight && distance <= approachDistance + 1f)
+                return BTStatus.Failure;
+
+            if (fromPlayer.sqrMagnitude < 0.1f)
+                fromPlayer = Quaternion.AngleAxis((int)m_Order.Role * 120f, Vector3.up) * Vector3.forward;
+            Vector3 desired = SquadBlackboard.PlayerPosition + fromPlayer.normalized * approachDistance;
+            if (!NavMesh.SamplePosition(desired, out NavMeshHit sample, 5f, NavMesh.AllAreas) ||
+                !TryGetCompletePathLength(transform.position, sample.position, out _) ||
+                Vector3.Distance(transform.position, sample.position) < 1.5f)
+                return BTStatus.Failure;
+
+            SetDestinationOnNavMesh(sample.position, 1.5f);
+            return BTStatus.Running;
+        }
+
+        /// <summary>
         /// 开火机会高于阵型移动。随机冷却即将结束且当前有视线、距离合适时，
         /// 暂停 NavMesh 移动，让并行战斗分支稳定瞄准并立即发射。
         /// </summary>
@@ -762,19 +803,11 @@ namespace CE6127.Tanks.AI
                 NavMeshAgent.isStopped = false;
 
                 Vector3 destination = m_Order.Slot;
-                if (Vector3.Distance(transform.position, destination) < 2.5f)
+                if (Vector3.Distance(transform.position, destination) <= 2.5f)
                 {
-                    // 到达槽位后沿玩家周围继续走弧线，不原地成为容易命中的固定靶。
-                    Vector3 radial = transform.position - SquadBlackboard.PlayerPosition;
-                    radial.y = 0f;
-                    if (radial.sqrMagnitude > 0.1f)
-                    {
-                        Vector3 tangent = Vector3.Cross(Vector3.up, radial.normalized);
-                        if (m_Order.Role == SquadRole.LeftInterceptor ||
-                            (m_Order.Role == SquadRole.Pressure && (GetInstanceID() & 1) == 0))
-                            tangent = -tangent;
-                        destination += tangent * 4f;
-                    }
+                    // 槽位到位后保持射击姿态；不再额外沿切线绕圈造成无意义转向。
+                    NavMeshAgent.isStopped = true;
+                    return BTStatus.Running;
                 }
                 NavMeshAgent.SetDestination(destination);
             }
@@ -802,10 +835,10 @@ namespace CE6127.Tanks.AI
                 m_PredictedAimPoint, out m_SelectedLaunchForce, out flightTime);
 
             Vector3 facingPoint = m_PredictedAimPoint;
-            // 玩家被墙挡住时先朝 NavMesh 的下一个拐角转，避免车体瞄着墙横向硬挤。
+            // 只有实际射线被建筑挡住时才朝路径拐角转；有视线时必须持续朝预瞄点转，
+            // 否则 IsAimed 永远不会通过，近距离也不会开火。
             if (NavMeshAgent.isOnNavMesh && NavMeshAgent.hasPath &&
-                NavMesh.Raycast(transform.position, SquadBlackboard.PlayerPosition,
-                    out _, NavMesh.AllAreas))
+                !HasDirectLineOfSightFrom(transform.position))
                 facingPoint = NavMeshAgent.steeringTarget;
 
             Vector3 facingDirection = facingPoint - transform.position;
