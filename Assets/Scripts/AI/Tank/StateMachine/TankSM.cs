@@ -74,7 +74,7 @@ namespace CE6127.Tanks.AI
         [HideInInspector] public float NavMeshUpdateDeadline;       // The time when the next path update is due.
         [Header("Firing")]
         [Tooltip("Minimum and maximum cooldown time delay between each firing in seconds.")]
-        public Vector2 FireInterval = new(0.7f, 2.5f);              // A minimum and maximum cooldown time delay between each firing.
+        public Vector2 FireInterval = new(0.7f, 0.7f);              // Minimum cooldown for the fastest AI firing rate.
         [Tooltip("Force given to the shell if the fire button is not held, and the force given to the shell if the fire button is held for the max charge time in seconds.")]
         public Vector2 LaunchForceMinMax = new(6.5f, 30f);          // The force given to the shell if the fire button is not held, and the force given to the shell if the fire button is held for the max charge time.
         [Header("References")]
@@ -215,7 +215,7 @@ namespace CE6127.Tanks.AI
             if (!m_Started && GameManager.IsRoundPlaying)
             {
                 m_Started = true;
-                m_NextFireTime = Time.time + Random.Range(0.05f, FireInterval.x);
+                m_NextFireTime = Time.time + 0.05f;
                 m_LastProgressPosition = transform.position;
                 m_StuckSince = 0f;
             }
