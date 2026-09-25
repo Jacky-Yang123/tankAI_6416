@@ -57,7 +57,6 @@ namespace CE6127.Tanks.AI
         public static float PlayerChargeRatio { get; private set; }
         public static bool PlayerCoolingDown { get; private set; }
         public static bool PlayerEscaping { get; private set; }
-        public static bool PlayerInNarrowArea { get; private set; }
         public static float EscapeConfidence { get; private set; }
         public static float RemainingRoundTime { get; private set; }
         public static float TimePressure { get; private set; }
@@ -102,7 +101,7 @@ namespace CE6127.Tanks.AI
                 };
         }
 
-        /// <summary>每帧只更新一次感知；较昂贵的路径与职责分配每0.3秒更新一次。</summary>
+        /// <summary>每帧只更新一次感知；较昂贵的路径与职责分配每0.2秒更新一次。</summary>
         public static void Update(GameManager gameManager)
         {
             if (s_LastFrame == Time.frameCount)
@@ -120,7 +119,6 @@ namespace CE6127.Tanks.AI
                 return;
 
             ReadPlayer(gameManager);
-            UpdatePlayerTerrain();
             ReadPlayerWeapon();
             List<TankSM> tanks = ReadLivingSquad(gameManager, out Vector3 squadCentre);
             if (tanks.Count == 0)
@@ -131,7 +129,7 @@ namespace CE6127.Tanks.AI
 
             if (Time.time >= s_NextTacticalUpdate)
             {
-                s_NextTacticalUpdate = Time.time + 0.3f;
+                s_NextTacticalUpdate = Time.time + 0.2f;
                 AssignTacticalOrders(tanks, gameManager.Speed);
             }
 
@@ -154,7 +152,6 @@ namespace CE6127.Tanks.AI
             s_PreviousSquadDistance = 0f;
             EscapeConfidence = 0f;
             PlayerEscaping = false;
-            PlayerInNarrowArea = false;
             s_SmoothedPlayerVelocity = Vector3.zero;
             s_PreviousPlayer = null;
             s_PreviousVelocitySampleTime = 0f;
@@ -164,32 +161,6 @@ namespace CE6127.Tanks.AI
             s_KnownPlayerShells.Clear();
             PlayerShells.Clear();
             s_Orders.Clear();
-        }
-
-        /// <summary>
-        /// 从玩家位置向八个方向探测 NavMesh 边缘。近距离内至少四个方向被挡住，
-        /// 说明玩家位于通道、建筑夹角或地图角落，此时不强求三角阵型。
-        /// </summary>
-        private static void UpdatePlayerTerrain()
-        {
-            if (!NavMesh.SamplePosition(PlayerPosition, out NavMeshHit centre, 2f, NavMesh.AllAreas))
-            {
-                PlayerInNarrowArea = false;
-                return;
-            }
-
-            const float probeDistance = 7f;
-            int blockedDirections = 0;
-            for (int i = 0; i < 8; ++i)
-            {
-                Vector3 direction = Quaternion.AngleAxis(i * 45f, Vector3.up) * Vector3.forward;
-                if (NavMesh.Raycast(centre.position, centre.position + direction * probeDistance,
-                        out NavMeshHit edge, NavMesh.AllAreas) &&
-                    Vector3.Distance(centre.position, edge.position) < probeDistance * 0.9f)
-                    blockedDirections++;
-            }
-            // 用滞后避免站在障碍物边缘时在“通道/开阔”两种判断间逐帧跳变。
-            PlayerInNarrowArea = blockedDirections >= (PlayerInNarrowArea ? 3 : 4);
         }
 
         private static void ReadPlayer(GameManager gameManager)
@@ -354,14 +325,14 @@ namespace CE6127.Tanks.AI
         {
             float radius;
             if (RemainingRoundTime > 45f)
-                radius = 16f;
+                radius = 17f;
             else if (RemainingRoundTime > 20f)
-                radius = 14f;
+                radius = 15f;
             else
-                radius = 12f;
+                radius = 12.75f;
 
             if (PlayerCoolingDown)
-                radius -= RemainingRoundTime > 20f ? 1.25f : 0.75f;
+                radius -= RemainingRoundTime > 20f ? 1f : 0.5f;
             return Mathf.Max(11.5f, radius);
         }
 
@@ -405,8 +376,7 @@ namespace CE6127.Tanks.AI
                     cost += targets[tankIndex, roleIndex].Cost;
                     if (s_Orders.TryGetValue(tanks[tankIndex].GetInstanceID(), out SquadOrder oldOrder) &&
                         oldOrder.HasSlot && oldOrder.Role != (SquadRole)roleIndex)
-                        // 只有路径明显更好时才换职责，避免每0.3秒互换槽位造成反复掉头。
-                        cost += 12f;
+                        cost += 5f;
                 }
                 if (cost < bestCost)
                 {
@@ -432,7 +402,7 @@ namespace CE6127.Tanks.AI
             if (!allIn && fleeing && missingIntercept && requestedMode != SquadMode.CorneredAttack)
                 Mode = SquadMode.Herd;
 
-            EnsureDifferentDestinations(chosenPositions, chosenRoles, tanks, right);
+            EnsureDifferentDestinations(chosenPositions, chosenRoles, right);
             for (int tankIndex = 0; tankIndex < count; ++tankIndex)
             {
                 s_Orders[tanks[tankIndex].GetInstanceID()] = new SquadOrder
@@ -462,13 +432,12 @@ namespace CE6127.Tanks.AI
             {
                 float baseAngle = role == SquadRole.Pressure ? 180f :
                     role == SquadRole.LeftInterceptor ? 60f : -60f;
-                // 常规阶段固定槽位，避免每次重算都要求坦克转向追逐旋转阵型；
-                // 最后20秒才缓慢换位，制造新的射击角度。
-                float orbitSpeed = RemainingRoundTime <= 20f ? 6f : 0f;
+                // 整个三角阵型共同旋转，因此三车持续大幅换位但始终保持120度关系。
+                float orbitSpeed = RemainingRoundTime <= 20f ? 24f : 18f;
                 float angle = baseAngle + Time.time * orbitSpeed;
                 Vector3 desired = PlayerPosition +
                                   Quaternion.AngleAxis(angle, Vector3.up) * PlayerForward * CombatRadius;
-                Vector3 slot = FindTerrainAwareSlot(tank, desired, role);
+                Vector3 slot = SampleWalkable(desired, PlayerPosition, (int)role, 8f);
                 return new RoleTarget
                 {
                     Position = slot,
@@ -479,10 +448,10 @@ namespace CE6127.Tanks.AI
 
             if (role == SquadRole.Pressure)
             {
-                float pressureDistance = RemainingRoundTime > 45f ? 16.5f :
-                    RemainingRoundTime > 20f ? 14.5f : 12f;
+                float pressureDistance = RemainingRoundTime > 45f ? 18f :
+                    RemainingRoundTime > 20f ? 16f : 13f;
                 Vector3 desired = PlayerPosition - direction * pressureDistance;
-                Vector3 slot = FindTerrainAwareSlot(tank, desired, role);
+                Vector3 slot = SampleWalkable(desired, PlayerPosition, 0, 8f);
                 return new RoleTarget
                 {
                     Position = slot,
@@ -563,7 +532,7 @@ namespace CE6127.Tanks.AI
         }
 
         private static void EnsureDifferentDestinations(
-            Vector3[] positions, SquadRole[] roles, List<TankSM> tanks, Vector3 right)
+            Vector3[] positions, SquadRole[] roles, Vector3 right)
         {
             for (int i = 0; i < positions.Length; ++i)
             {
@@ -584,14 +553,8 @@ namespace CE6127.Tanks.AI
                     Vector3 desired = original + offset;
                     if (!NavMesh.SamplePosition(desired, out NavMeshHit hit, 3f, NavMesh.AllAreas))
                         continue;
-                    float pathLength = PathLength(tanks[i].transform.position, hit.position);
-                    if (pathLength >= 9999f)
-                        continue;
                     float minimum = MinimumDistanceToEarlierSlots(positions, i, hit.position);
-                    float terrainPenalty = CountNearbyNavMeshEdges(hit.position, 4f) * 0.8f;
-                    float sightPenalty = HasTerrainLineOfSight(hit.position) ? 0f : 8f;
-                    float score = minimum - Vector3.Distance(original, hit.position) * 0.15f -
-                                  terrainPenalty - sightPenalty - pathLength * 0.02f;
+                    float score = minimum - Vector3.Distance(original, hit.position) * 0.15f;
                     if (score <= bestScore)
                         continue;
                     bestScore = score;
@@ -601,92 +564,6 @@ namespace CE6127.Tanks.AI
                 }
                 positions[i] = best;
             }
-        }
-
-        /// <summary>
-        /// 理论阵型点只是起点。围绕该角度搜索不同半径和角度，综合完整路径、
-        /// 玩家视线、局部空间以及偏离阵型的距离，选择真正适合当前地形的槽位。
-        /// </summary>
-        private static Vector3 FindTerrainAwareSlot(
-            TankSM tank, Vector3 desired, SquadRole role)
-        {
-            Vector3 radial = desired - PlayerPosition;
-            radial.y = 0f;
-            if (radial.sqrMagnitude < 0.1f)
-                radial = Quaternion.AngleAxis((int)role * 120f, Vector3.up) * PlayerForward;
-            float desiredRadius = Mathf.Max(8f, radial.magnitude);
-            radial.Normalize();
-
-            float[] angleOffsets = { 0f, -25f, 25f, -50f, 50f };
-            float[] radiusOffsets = { 0f, -2f };
-            Vector3 best = tank.transform.position;
-            float bestScore = float.MaxValue;
-
-            foreach (float angleOffset in angleOffsets)
-            {
-                foreach (float radiusOffset in radiusOffsets)
-                {
-                    Vector3 candidateDirection = Quaternion.AngleAxis(angleOffset, Vector3.up) * radial;
-                    Vector3 candidateDesired = PlayerPosition +
-                                               candidateDirection * Mathf.Max(8f, desiredRadius + radiusOffset);
-                    if (!NavMesh.SamplePosition(candidateDesired, out NavMeshHit sample, 3f,
-                            NavMesh.AllAreas))
-                        continue;
-
-                    float pathLength = PathLength(tank.transform.position, sample.position);
-                    if (pathLength >= 9999f)
-                        continue;
-                    float formationDeviation = Vector3.Distance(sample.position, desired);
-                    float terrainPenalty = CountNearbyNavMeshEdges(sample.position, 4f) * 2.5f;
-                    float sightPenalty = HasTerrainLineOfSight(sample.position) ? 0f : 22f;
-                    float score = pathLength + formationDeviation * 0.65f +
-                                  terrainPenalty + sightPenalty;
-                    if (score >= bestScore)
-                        continue;
-                    bestScore = score;
-                    best = sample.position;
-                }
-            }
-            return best;
-        }
-
-        private static int CountNearbyNavMeshEdges(Vector3 position, float distance)
-        {
-            int blocked = 0;
-            for (int i = 0; i < 4; ++i)
-            {
-                Vector3 direction = Quaternion.AngleAxis(i * 90f, Vector3.up) * Vector3.forward;
-                if (NavMesh.Raycast(position, position + direction * distance,
-                        out NavMeshHit edge, NavMesh.AllAreas) &&
-                    Vector3.Distance(position, edge.position) < distance * 0.9f)
-                    blocked++;
-            }
-            return blocked;
-        }
-
-        private static bool HasTerrainLineOfSight(Vector3 groundPosition)
-        {
-            if (Player == null)
-                return false;
-            Vector3 origin = groundPosition + Vector3.up * 1.2f;
-            Vector3 target = PlayerPosition + Vector3.up * 0.85f;
-            Vector3 ray = target - origin;
-            if (ray.sqrMagnitude < 0.01f)
-                return true;
-
-            RaycastHit[] hits = Physics.RaycastAll(
-                origin, ray.normalized, ray.magnitude, ~0, QueryTriggerInteraction.Ignore);
-            System.Array.Sort(hits, (a, b) => a.distance.CompareTo(b.distance));
-            foreach (RaycastHit hit in hits)
-            {
-                Transform root = hit.transform.root;
-                if (root == Player.root)
-                    return true;
-                if (root.GetComponent<TankSM>() != null)
-                    continue;
-                return false;
-            }
-            return true;
         }
 
         private static float MinimumDistanceToEarlierSlots(
